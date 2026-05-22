@@ -1,4 +1,4 @@
-import { _decorator, Component, Node, Vec3, UITransform, Label, Color, tween, Graphics, director, Canvas, Mask, view, ResolutionPolicy } from 'cc';
+import { _decorator, Component, Node, Vec3, UITransform, Label, Color, tween, Graphics, director, Canvas, Mask, screen, ResolutionPolicy, Layers } from 'cc';
 import { loginAndGetProgress, saveProgress } from './api';
 
 const { ccclass } = _decorator;
@@ -44,6 +44,8 @@ interface PlateData {
     screws: ScrewData[];
     holes: { x: number; y: number }[];
     removed: boolean;
+    isFalling?: boolean;
+    fallDistance?: number;
     rotation?: number;
     gravityOrigin?: { x: number; y: number };
 }
@@ -54,6 +56,34 @@ interface BoxData {
     screws: ScrewColor[];
     isNew: boolean;
     isSlidingOut?: boolean;
+    clearScheduled?: boolean;
+}
+
+interface BoxSlotView {
+    node: Node;
+    hole: Graphics;
+    screwHost: Node;
+}
+
+interface BoxView {
+    node: Node;
+    body: Graphics;
+    lockLabel: Label;
+    slots: BoxSlotView[];
+}
+
+interface TempSlotView {
+    node: Node;
+    hole: Graphics;
+    screwHost: Node;
+}
+
+interface ToolView {
+    key: 'add' | 'break' | 'clear';
+    node: Node;
+    iconLabel: Label;
+    badge: Graphics;
+    badgeLabel: Label;
 }
 
 const COLORS: ScrewColor[] = [
@@ -76,6 +106,17 @@ const PLATE_TEMPLATES: PlateTemplate[] = [
     { type: 'circle', w: 140, h: 140, holes: [{ x: 0.5, y: 0.5 }] }
 ];
 
+const BOX_COLORS: Record<ScrewColor, Color> = {
+    [ScrewColor.RED]: new Color(209, 82, 102),
+    [ScrewColor.BLUE]: new Color(91, 137, 247),
+    [ScrewColor.YELLOW]: new Color(250, 203, 73),
+    [ScrewColor.PINK]: new Color(248, 127, 169),
+    [ScrewColor.ORANGE]: new Color(245, 150, 68),
+    [ScrewColor.GREEN]: new Color(85, 204, 163),
+    [ScrewColor.PURPLE]: new Color(165, 96, 232),
+    [ScrewColor.CYAN]: new Color(74, 192, 219)
+};
+
 const FACE_COLORS: Record<PlateTheme, Color> = {
     yellow: new Color(241, 208, 86, 255),
     blue: new Color(102, 138, 228, 255)
@@ -91,6 +132,9 @@ const SCREW_FACE_COLORS: Record<ScrewColor, Color> = {
     purple: new Color(134, 88, 213, 255),
     cyan: new Color(90, 206, 226, 255)
 };
+
+const PAGE_CONTENT_SCALE = 0.9;
+const TOP_CONTENT_OFFSET = 24;
 
 @ccclass('GameManager')
 export class GameManager extends Component {
@@ -109,6 +153,7 @@ export class GameManager extends Component {
     private topAreaNode: Node | null = null;
     private boardAreaNode: Node | null = null;
     private boardContentNode: Node | null = null;
+    private boardEffectNode: Node | null = null;
     private bottomAreaNode: Node | null = null;
     private boxesContainerNode: Node | null = null;
     private tempContainerNode: Node | null = null;
@@ -118,6 +163,11 @@ export class GameManager extends Component {
     private levelBadgeLabel: Label | null = null;
     private progressLabel: Label | null = null;
     private plateNodes = new Map<string, Node>();
+    private fallingPlateNodes = new Map<string, Node>();
+    private boxViews: BoxView[] = [];
+    private tempBgGraphics: Graphics | null = null;
+    private tempSlotViews: TempSlotView[] = [];
+    private toolViews: ToolView[] = [];
 
     private screenWidth = 0;
     private screenHeight = 0;
@@ -152,9 +202,6 @@ export class GameManager extends Component {
 
 
     private setupLayout() {
-        // 强制设置微信小游戏环境下的屏幕适配策略为 EXACT_FIT，拉伸铺满全屏
-        view.setDesignResolutionSize(375, 812, ResolutionPolicy.EXACT_FIT);
-
         // 使用固定的内部逻辑分辨率，确保所有硬编码的尺寸比例正常
         this.screenWidth = 375;
         this.screenHeight = 812;
@@ -167,8 +214,15 @@ export class GameManager extends Component {
         if (this.rootNode) {
             this.rootNode.destroy();
         }
+        this.plateNodes.clear();
+        this.fallingPlateNodes.clear();
+        this.boxViews = [];
+        this.tempBgGraphics = null;
+        this.tempSlotViews = [];
+        this.toolViews = [];
 
         this.rootNode = new Node('GameRoot');
+        this.rootNode.layer = Layers.Enum.UI_2D;
         const uiTransform = this.rootNode.addComponent(UITransform);
         uiTransform.setContentSize(this.screenWidth, this.screenHeight);
 
@@ -185,12 +239,20 @@ export class GameManager extends Component {
         let scale = 1;
         if (canvasNode) {
             this.rootNode.parent = canvasNode;
-            // 在微信小游戏环境下，直接使用 view 获取的实际可见区域大小来计算缩放
-            const visibleSize = view.getVisibleSize();
-            if (visibleSize.width > 0 && visibleSize.height > 0) {
-                const scaleX = visibleSize.width / this.screenWidth;
-                const scaleY = visibleSize.height / this.screenHeight;
-                // 微信下通常需要铺满，这里取较大值或者直接依赖 EXACT_FIT，这里取较小值保证内容不被裁切
+            
+            // 尝试通过 screen.windowSize 获取尺寸
+            const windowSize = screen.windowSize;
+            let visibleWidth = windowSize.width;
+            let visibleHeight = windowSize.height;
+
+            if (visibleWidth > 0 && visibleHeight > 0) {
+                // 如果是真机高分屏，尺寸可能会极大，需要除以 devicePixelRatio 转换回逻辑像素
+                const dpr = screen.devicePixelRatio || 1;
+                visibleWidth = visibleWidth / dpr;
+                visibleHeight = visibleHeight / dpr;
+
+                const scaleX = visibleWidth / this.screenWidth;
+                const scaleY = visibleHeight / this.screenHeight;
                 scale = Math.min(scaleX, scaleY);
             } else {
                 const canvasUI = canvasNode.getComponent(UITransform);
@@ -204,14 +266,14 @@ export class GameManager extends Component {
             this.rootNode.parent = this.node.parent || this.node;
         }
 
-        // 设置缩放，并居中显示
-        this.rootNode.setScale(new Vec3(scale, scale, 1));
+        // 整体缩小一圈，让真机上更接近原来的 Vue 版留白感
+        this.rootNode.setScale(new Vec3(scale * PAGE_CONTENT_SCALE, scale * PAGE_CONTENT_SCALE, 1));
         this.rootNode.setPosition(new Vec3(0, 0, 0));
 
         // 清理当前测试节点的默认文字
-        const selfLabel = this.node.getComponent(Label);
-        if (selfLabel) {
-            selfLabel.string = '';
+        const defaultLabelNode = this.node.getChildByName('Label');
+        if (defaultLabelNode) {
+            defaultLabelNode.active = false;
         }
 
         const background = this.createGraphicsNode('Background', this.rootNode, this.screenWidth, this.screenHeight, 0, 0);
@@ -232,6 +294,7 @@ export class GameManager extends Component {
         this.drawRoundedRect(boardBg.getComponent(Graphics)!, this.screenWidth, this.boardHeight, new Color(204, 220, 235, 255), 0);
 
         this.boardContentNode = this.createNode('BoardContent', this.boardAreaNode, 0, 0, this.boardWidth, this.boardHeight - 20);
+        this.boardEffectNode = this.createNode('BoardEffect', this.boardAreaNode, 0, 0, this.boardWidth, this.boardHeight - 20);
 
         this.bottomAreaNode = this.createNode('BottomArea', this.rootNode, 0, bottomY, this.screenWidth, this.bottomHeight);
         const bottomBg = this.createGraphicsNode('BottomBg', this.bottomAreaNode, this.screenWidth, this.bottomHeight, 0, 0);
@@ -241,23 +304,22 @@ export class GameManager extends Component {
         this.modalLayerNode.setSiblingIndex(999);
 
         this.buildStaticTopUI();
-        this.boxesContainerNode = this.createNode('Boxes', this.topAreaNode, 0, 8, this.screenWidth - 40, 130);
-        this.tempContainerNode = this.createNode('TempSlots', this.topAreaNode, 0, -this.topHeight * 0.26, this.screenWidth - 60, 90);
+        this.boxesContainerNode = this.createNode('Boxes', this.topAreaNode, 0, 8 - TOP_CONTENT_OFFSET, this.screenWidth - 40, 130);
+        this.tempContainerNode = this.createNode('TempSlots', this.topAreaNode, 0, -this.topHeight * 0.26 - TOP_CONTENT_OFFSET, this.screenWidth - 60, 90);
         this.toolContainerNode = this.createNode('Tools', this.bottomAreaNode, 0, 0, this.screenWidth - 40, this.bottomHeight - 10);
     }
 
     private buildStaticTopUI() {
         if (!this.topAreaNode) return;
 
-        const topInnerY = this.topHeight / 2 - 42;
+        const topInnerY = this.topHeight / 2 - 42 - TOP_CONTENT_OFFSET;
 
         this.levelBadgeLabel = this.createLabel(this.topAreaNode, '第 1 关', 0, topInnerY + 8, 22, new Color(255, 255, 255, 255), true);
 
         const badge = this.createGraphicsNode('LevelBadgeBg', this.topAreaNode, 130, 44, 0, topInnerY + 8);
         badge.setSiblingIndex(0);
         this.drawRoundedRect(badge.getComponent(Graphics)!, 130, 44, new Color(165, 172, 183, 255), 22);
-
-        this.progressLabel = this.createLabel(this.topAreaNode, '进度 0%', this.screenWidth / 2 - 78, -this.topHeight / 2 + 30, 16, new Color(52, 58, 68, 255), true);
+        this.progressLabel = null;
     }
 
     private initGame() {
@@ -265,13 +327,18 @@ export class GameManager extends Component {
         this.tempHoles = [];
         this.removedScrews = 0;
         this.tools = { add: 0, break: 1, clear: 1 };
+        this.fallingPlateNodes.clear();
+        if (this.boardEffectNode) {
+            this.boardEffectNode.removeAllChildren();
+        }
         this.boxes = [
-            { color: 'empty', capacity: 3, screws: [], isNew: false, isSlidingOut: false },
-            { color: 'empty', capacity: 3, screws: [], isNew: false, isSlidingOut: false },
-            { color: 'locked', capacity: 3, screws: [], isNew: false, isSlidingOut: false },
-            { color: 'locked', capacity: 3, screws: [], isNew: false, isSlidingOut: false }
+            { color: ScrewColor.YELLOW, capacity: 3, screws: [], isNew: false, isSlidingOut: false, clearScheduled: false },
+            { color: ScrewColor.BLUE, capacity: 3, screws: [], isNew: false, isSlidingOut: false, clearScheduled: false },
+            { color: 'locked', capacity: 3, screws: [], isNew: false, isSlidingOut: false, clearScheduled: false },
+            { color: 'locked', capacity: 3, screws: [], isNew: false, isSlidingOut: false, clearScheduled: false }
         ];
         this.generateLevel();
+        this.ensurePrimaryBoxes();
         this.renderAll();
     }
 
@@ -283,148 +350,104 @@ export class GameManager extends Component {
     }
 
     private renderTopUI() {
+        this.ensurePrimaryBoxes();
+        this.normalizeEndgameBoxes();
+
         if (this.titleLabel) {
             this.titleLabel.string = '放我出去呗';
         }
         if (this.levelBadgeLabel) {
             this.levelBadgeLabel.string = `第 ${this.currentLevel} 关`;
         }
-        if (this.progressLabel) {
-            this.progressLabel.string = `进度 ${this.getProgressText()}`;
-        }
-
         this.renderBoxes();
         this.renderTempSlots();
     }
 
     private renderBoxes() {
         if (!this.boxesContainerNode) return;
-        this.boxesContainerNode.removeAllChildren();
+        this.ensureBoxViews();
 
-        const boxWidth = Math.min(76, this.screenWidth * 0.18); // 再缩窄，原来是 84
-        const boxHeight = 80; // 再压扁，原来是 90
+        const boxWidth = Math.min(84, this.screenWidth * 0.2);
+        const boxHeight = 92;
         const gap = (this.screenWidth - 40 - boxWidth * 4) / 3;
         const startX = -((boxWidth * 4 + gap * 3) / 2) + boxWidth / 2;
 
         this.boxes.forEach((box, index) => {
+            if (index < 2 && !this.isValidPrimaryBoxColor(box.color)) {
+                const fallback = this.getPrimaryBoxFallbackColor(index);
+                this.updateBoxColor(box, fallback);
+            }
+
             const x = startX + index * (boxWidth + gap);
-            const boxNode = this.createNode(`Box_${index}`, this.boxesContainerNode!, x, 0, boxWidth, boxHeight);
-
-            const shadow = this.createGraphicsNode('Shadow', boxNode, boxWidth + 6, boxHeight + 6, 2, -2);
-            this.drawRoundedRect(shadow.getComponent(Graphics)!, boxWidth + 6, boxHeight + 6, new Color(210, 218, 228, 120), 10);
-
-            const body = this.createGraphicsNode('Body', boxNode, boxWidth, boxHeight, 0, 0);
+            const view = this.boxViews[index];
+            const boxNode = view.node;
+            boxNode.setPosition(new Vec3(x, 0, 0));
+            boxNode.active = true;
             const bodyColor = box.color === 'locked'
                 ? new Color(91, 204, 189, 255)
                 : box.color === 'empty'
-                    ? new Color(240, 244, 249, 0)
+                    ? new Color(200, 200, 200, 255) // 修复空盒子颜色不可见问题
                     : this.getBoxColor(box.color);
-            this.drawRoundedRect(body.getComponent(Graphics)!, boxWidth, boxHeight, bodyColor, 10, box.color === 'empty' ? 0 : 4, new Color(255, 255, 255, 210));
+            this.drawRoundedRect(view.body, boxWidth, boxHeight, bodyColor, 12, box.color === 'empty' ? 0 : 4, new Color(255, 255, 255, 210));
 
-            if (box.color !== 'empty') {
-                const handle = this.createGraphicsNode('Handle', boxNode, 38, 14, 0, boxHeight / 2 + 5);
-                this.drawRoundedRect(handle.getComponent(Graphics)!, 38, 14, new Color(217, 218, 219, 255), 6, 2, new Color(190, 192, 197, 255));
-            }
+            const isLocked = box.color === 'locked';
+            view.lockLabel.node.active = isLocked;
+            view.slots.forEach((slotView, slotIndex) => {
+                slotView.node.active = !isLocked;
+                if (isLocked) {
+                    this.updateScrewHost(slotView.screwHost, 26);
+                    return;
+                }
 
-            if (box.color === 'locked') {
-                this.createLabel(boxNode, '解锁\n盒子', 0, 0, 14, new Color(255, 255, 255, 255), true, 18);
-                boxNode.on(Node.EventType.TOUCH_END, () => this.handleUnlockBox(box), this);
-            } else if (box.color !== 'empty') {
-                const slotPositions = [
-                    { x: -14, y: 14 },
-                    { x: 14, y: 14 },
-                    { x: 0, y: -10 }
-                ];
-                slotPositions.forEach((pos, slotIndex) => {
-                    if (!box.screws[slotIndex]) {
-                        const slot = this.createGraphicsNode(`Slot_${slotIndex}`, boxNode, 20, 20, pos.x, pos.y);
-                        this.drawCircle(slot.getComponent(Graphics)!, 10, new Color(0, 0, 0, 35), 0);
-                    } else {
-                        this.createScrewVisual(boxNode, pos.x, pos.y, 22, box.screws[slotIndex], false);
-                    }
-                });
-            }
+                const screwColor = box.color === 'empty' ? undefined : box.screws[slotIndex];
+                slotView.hole.node.active = !screwColor;
+                this.updateScrewHost(slotView.screwHost, 26, screwColor);
+            });
 
             if (box.isNew) {
                 boxNode.scale = new Vec3(0.92, 0.92, 1);
                 tween(boxNode).to(0.18, { scale: new Vec3(1.04, 1.04, 1) }).to(0.16, { scale: new Vec3(1, 1, 1) }).start();
                 box.isNew = false;
+            } else {
+                boxNode.setScale(new Vec3(1, 1, 1));
             }
         });
     }
 
     private renderTempSlots() {
         if (!this.tempContainerNode) return;
-        this.tempContainerNode.removeAllChildren();
+        this.ensureTempSlotViews();
 
-        const containerW = this.screenWidth - 120; // 再次收窄，原来是 -90
-        const containerH = 40; // 再次压扁高度，原来是 50
-        const bgNode = this.createGraphicsNode('TempBg', this.tempContainerNode, containerW, containerH, 0, 0);
-        this.drawRoundedRect(bgNode.getComponent(Graphics)!, containerW, containerH, new Color(228, 233, 240, 255), 20, 2, new Color(255, 255, 255, 180));
-
-        const slotRadius = 12; // 孔位再次缩小，原来是 14
-        const spacing = slotRadius * 2 + 6; // 间距收紧，原来是 + 10
-        const startX = -spacing * 2;
-
-        for (let i = 0; i < this.maxTempHoles; i++) {
-            const slotNode = this.createGraphicsNode(`TempSlot_${i}`, this.tempContainerNode, slotRadius * 2, slotRadius * 2, startX + i * spacing, 0);
-            this.drawCircle(slotNode.getComponent(Graphics)!, slotRadius, new Color(202, 206, 212, 255), 0);
-            if (this.tempHoles[i]) {
-                this.createScrewVisual(this.tempContainerNode, startX + i * spacing, 0, slotRadius * 2 - 2, this.tempHoles[i], false);
-            }
+        const containerW = this.screenWidth - 154;
+        const containerH = 36;
+        if (this.tempBgGraphics) {
+            this.drawRoundedRect(this.tempBgGraphics, containerW, containerH, new Color(228, 233, 240, 255), 15, 2, new Color(255, 255, 255, 180));
         }
+
+        this.tempSlotViews.forEach((slotView, index) => {
+            const color = this.tempHoles[index];
+            this.updateScrewHost(slotView.screwHost, 26, color);
+        });
     }
 
     private renderTools() {
         if (!this.toolContainerNode) return;
-        this.toolContainerNode.removeAllChildren();
+        this.ensureToolViews();
 
         const toolList = [
             { key: 'add' as const, label: '加孔位', icon: '🔍', count: this.tools.add },
             { key: 'break' as const, label: '熔玻璃', icon: '🔨', count: this.tools.break },
             { key: 'clear' as const, label: '清空孔位', icon: '🧹', count: this.tools.clear }
         ];
-
-        const buttonWidth = 90;
-        const buttonHeight = 100;
-        const gap = (this.screenWidth - 40 - buttonWidth * 3) / 2;
-        const startX = -((buttonWidth * 3 + gap * 2) / 2) + buttonWidth / 2;
-
         toolList.forEach((tool, index) => {
-            const x = startX + index * (buttonWidth + gap);
-            const btnNode = this.createNode(`ToolBtn_${tool.key}`, this.toolContainerNode!, x, 0, buttonWidth, buttonHeight);
-
-            // 背景阴影层
-            const shadow = this.createGraphicsNode('Shadow', btnNode, buttonWidth + 8, buttonHeight + 8, 0, -2);
-            this.drawRoundedRect(shadow.getComponent(Graphics)!, buttonWidth + 8, buttonHeight + 8, new Color(201, 218, 234, 255), 24);
-
-            // 主底板 (带有描边效果)
-            const body = this.createGraphicsNode('Body', btnNode, buttonWidth, buttonHeight, 0, 0);
-            this.drawRoundedRect(body.getComponent(Graphics)!, buttonWidth, buttonHeight, new Color(138, 77, 232, 255), 22, 6, new Color(175, 133, 240, 255));
-
-            // 图标与文字
-            const iconLabel = this.createLabel(btnNode, tool.icon, 0, 10, 36, new Color(255, 255, 255, 255), false, 40);
-            iconLabel.enableWrapText = false;
-            // 如果工具数量不够且不是加号，增加半透明过滤效果（Cocos 中暂时用颜色变暗模拟）
-            if (tool.count <= 0 && tool.key !== 'add') {
-                iconLabel.color = new Color(200, 200, 200, 255);
-            }
-            this.createLabel(btnNode, tool.label, 0, -26, 18, new Color(255, 255, 255, 255), true);
-
-            // 右上角数字徽标
-            const badgeSize = 34;
-            const badgeX = buttonWidth / 2 - 8;
-            const badgeY = buttonHeight / 2 - 8;
-            const badge = this.createGraphicsNode('Badge', btnNode, badgeSize, badgeSize, badgeX, badgeY);
-            
-            // 如果没数量了且是功能道具，徽标变成灰色
+            const view = this.toolViews[index];
+            view.iconLabel.string = tool.icon;
+            view.iconLabel.color = (tool.count <= 0 && tool.key !== 'add')
+                ? new Color(200, 200, 200, 255)
+                : new Color(255, 255, 255, 255);
             const badgeColor = (tool.count <= 0 && tool.key !== 'add') ? new Color(168, 162, 158, 255) : new Color(245, 158, 11, 255);
-            this.drawCircle(badge.getComponent(Graphics)!, badgeSize / 2, badgeColor, 3, new Color(255, 238, 196, 255));
-            this.createLabel(btnNode, String(tool.count > 0 ? tool.count : '+'), badgeX, badgeY, 20, new Color(255, 255, 255, 255), true);
-
-            btnNode.on(Node.EventType.TOUCH_END, () => {
-                this.useTool(tool.key);
-            }, this);
+            this.drawCircle(view.badge, 13, badgeColor, 3, new Color(255, 238, 196, 255));
+            view.badgeLabel.string = String(tool.count > 0 ? tool.count : '+');
         });
     }
 
@@ -435,46 +458,7 @@ export class GameManager extends Component {
 
         const visiblePlates = this.plates.filter((plate) => !plate.removed).sort((a, b) => a.layer - b.layer);
         visiblePlates.forEach((plate) => {
-            let pivotX = plate.x;
-            let pivotY = plate.y;
-            let offsetX = 0;
-            let offsetY = 0;
-
-            if (plate.gravityOrigin) {
-                offsetX = plate.gravityOrigin.x - plate.w / 2;
-                offsetY = plate.h / 2 - plate.gravityOrigin.y;
-                pivotX = plate.x + offsetX;
-                pivotY = plate.y + offsetY;
-            }
-
-            const pivotNode = this.createNode(`Pivot_${plate.id}`, this.boardContentNode!, pivotX, pivotY, 0, 0);
-            pivotNode.angle = plate.rotation || 0;
-            this.plateNodes.set(plate.id, pivotNode);
-
-            const plateNode = this.createNode(`PlateVisual_${plate.id}`, pivotNode, -offsetX, -offsetY, plate.w, plate.h);
-
-            const shadow = this.createGraphicsNode('Shadow', plateNode, plate.w + 6, plate.h + 6, 6, -6);
-            this.drawPlateShape(shadow.getComponent(Graphics)!, plate.type, plate.w + 6, plate.h + 6, new Color(162, 176, 190, 105), 24, 0);
-
-            const face = this.createGraphicsNode('Face', plateNode, plate.w, plate.h, 0, 0);
-            this.drawPlateShape(face.getComponent(Graphics)!, plate.type, plate.w, plate.h, FACE_COLORS[plate.color], 22, 5, new Color(245, 248, 250, 230));
-
-            plate.screws.filter((screw) => !screw.removed).forEach((screw) => {
-                const screwSize = 38;
-                const localX = -plate.w / 2 + screw.x;
-                const localY = plate.h / 2 - screw.y;
-                
-                const screwContainer = this.createNode(`ScrewContainer_${screw.id}`, plateNode, localX, localY, screwSize, screwSize);
-                
-                const holeShadow = this.createGraphicsNode('Hole', screwContainer, screwSize, screwSize, 0, 0);
-                this.drawCircle(holeShadow.getComponent(Graphics)!, screwSize / 2, new Color(0, 0, 0, 40), 0);
-                
-                const screwNode = this.createScrewVisual(screwContainer, 0, 0, screwSize, screw.color, true);
-                screwNode.on(Node.EventType.TOUCH_END, (e) => {
-                    e.propagationStopped = true;
-                    this.handleScrewClick(plate, screw);
-                }, this);
-            });
+            this.createPlateNode(this.boardContentNode!, plate, true);
         });
     }
 
@@ -514,6 +498,15 @@ export class GameManager extends Component {
         const levelNum = this.currentLevel;
         const numColors = Math.min(COLORS.length, 4 + Math.floor((levelNum - 1) / 2));
         const activeColors = COLORS.slice(0, numColors);
+        this.boxes[0].color = 'empty';
+        this.boxes[1].color = 'empty';
+        this.boxes[2].color = 'locked';
+        this.boxes[3].color = 'locked';
+        this.boxes.forEach((box) => {
+            box.screws = [];
+            box.isNew = false;
+            box.isSlidingOut = false;
+        });
         const numTriplets = Math.min(15, 2 + levelNum);
         const screwsToPlace: ScrewColor[] = [];
 
@@ -527,17 +520,24 @@ export class GameManager extends Component {
 
         const distinctColors = [...new Set(screwsToPlace)];
         this.boxes[0].color = distinctColors[0] || ScrewColor.YELLOW;
-        this.boxes[1].color = distinctColors[1] || activeColors.find((color) => color !== this.boxes[0].color) || distinctColors[0] || ScrewColor.BLUE;
+        if (distinctColors.length > 1) {
+            this.boxes[1].color = distinctColors[1];
+        } else {
+            const otherColors = activeColors.filter((color) => color !== distinctColors[0]);
+            this.boxes[1].color = otherColors.length > 0
+                ? otherColors[Math.floor(Math.random() * otherColors.length)]
+                : (distinctColors[0] || ScrewColor.BLUE);
+        }
 
         let availableTemplates = PLATE_TEMPLATES;
         if (levelNum === 1) {
             availableTemplates = PLATE_TEMPLATES.filter((template) => template.holes.length >= 3);
         }
 
-        const spreadFactor = Math.max(0.5, 1.2 - levelNum * 0.1); 
-        const rangeX = 160 * spreadFactor; // 扩大范围，避免太居中
-        const rangeY = 220 * spreadFactor; 
-        const centerYOffset = 0;
+        const spreadFactor = Math.max(0.62, 1.16 - levelNum * 0.07);
+        const rangeX = 168 * spreadFactor;
+        const rangeY = 228 * spreadFactor;
+        const centerYOffset = 12;
         const generatedCenters: { x: number; y: number }[] = [];
         let totalHolesAvailable = 0;
         let plateIndex = 0;
@@ -550,7 +550,7 @@ export class GameManager extends Component {
 
             for (let tryCount = 0; tryCount < 10; tryCount++) {
                 const tx = (Math.random() * 2 - 1) * rangeX;
-                const ty = (Math.random() * 2 - 1) * rangeY;
+                const ty = centerYOffset + (Math.random() * 2 - 1) * rangeY;
                 if (generatedCenters.length === 0) {
                     x = tx;
                     y = ty;
@@ -609,6 +609,8 @@ export class GameManager extends Component {
                 screws: [],
                 holes: actualHoles,
                 removed: false,
+                isFalling: false,
+                fallDistance: 0,
                 rotation: 0
             });
 
@@ -676,6 +678,7 @@ export class GameManager extends Component {
         if (this.gameOver) return;
 
         if (this.isScrewBlocked(plate, screw)) {
+            this.triggerVibration('light');
             const plateNode = this.plateNodes.get(plate.id);
             if (plateNode) {
                 const origin = plateNode.position.clone();
@@ -688,6 +691,8 @@ export class GameManager extends Component {
             }
             return;
         }
+
+        this.triggerVibration('heavy');
 
         const targetBox = this.boxes.find((box) => box.color === screw.color && box.screws.length < box.capacity);
         if (!targetBox) {
@@ -714,38 +719,19 @@ export class GameManager extends Component {
         this.renderTopUI();
 
         if (targetBox && targetBox.screws.length === targetBox.capacity) {
-            this.scheduleOnce(() => {
-                this.clearBoxAndAssignNewColor(targetBox);
-            }, 0.25);
+            this.scheduleBoxClear(targetBox, 0.25, true);
         }
 
         const remaining = plate.screws.filter((item) => !item.removed);
         if (remaining.length === 0) {
-            this.renderBoard();
-            const plateNode = this.plateNodes.get(plate.id);
-            if (plateNode) {
-                tween(plateNode)
-                    .to(0.7, { position: new Vec3(plateNode.position.x, plateNode.position.y - this.boardHeight - 120, 0), angle: (plate.rotation || 0) - 18 }, { easing: 'quadIn' })
-                    .call(() => {
-                        plate.removed = true;
-                        this.renderBoard();
-                        this.checkWin();
-                    })
-                    .start();
-            } else {
-                plate.removed = true;
-                this.renderBoard();
-                this.checkWin();
-            }
+            this.startPlateFalling(plate);
         } else {
             const oldRotation = plate.rotation || 0;
             this.updatePlateGravity(plate);
-            this.renderBoard();
+            const plateNode = this.refreshPlateNode(plate, oldRotation);
 
             if (oldRotation !== (plate.rotation || 0)) {
-                const plateNode = this.plateNodes.get(plate.id);
                 if (plateNode) {
-                    plateNode.angle = oldRotation;
                     // 旋转动画时间从 0.5 秒延长到 1.2 秒，使用 backOut 缓动让它下垂时有轻微回弹，显得更真实沉重
                     tween(plateNode).stop();
                     tween(plateNode)
@@ -759,36 +745,30 @@ export class GameManager extends Component {
     }
 
     private clearBoxAndAssignNewColor(targetBox: BoxData) {
+        if (!this.canClearBox(targetBox)) {
+            targetBox.clearScheduled = false;
+            targetBox.isSlidingOut = false;
+            this.renderBoxes();
+            return;
+        }
+
+        targetBox.clearScheduled = false;
         targetBox.isSlidingOut = true;
         this.renderBoxes();
 
         this.scheduleOnce(() => {
+            if (!this.canClearBox(targetBox)) {
+                targetBox.isSlidingOut = false;
+                this.renderBoxes();
+                return;
+            }
+
             targetBox.screws = [];
             targetBox.isSlidingOut = false;
 
-            let colorsToConsider = new Set<ScrewColor>();
-            this.plates.forEach((plate) => {
-                if (plate.removed) return;
-                plate.screws.forEach((screw) => {
-                    if (!screw.removed && !this.isScrewBlocked(plate, screw)) {
-                        colorsToConsider.add(screw.color);
-                    }
-                });
-            });
-
-            let remaining = Array.from(colorsToConsider);
-            if (remaining.length === 0) {
-                remaining = this.getRemainingColors();
-            }
-
-            const currentColors = this.boxes.filter((box) => box !== targetBox && box.color !== 'locked' && box.color !== 'empty').map((box) => box.color);
-            let available = remaining.filter((color) => currentColors.indexOf(color) === -1);
-            if (available.length === 0) {
-                available = this.getRemainingColors().filter((color) => currentColors.indexOf(color) === -1);
-            }
-
-            targetBox.color = available.length > 0 ? available[Math.floor(Math.random() * available.length)] : 'empty';
-            targetBox.isNew = available.length > 0;
+            const nextColor = this.pickRefreshColor(targetBox);
+            this.updateBoxColor(targetBox, nextColor);
+            targetBox.isNew = nextColor !== 'empty';
             this.renderTopUI();
             this.autoFillFromTemp();
             this.checkWin();
@@ -806,13 +786,12 @@ export class GameManager extends Component {
             changed = true;
 
             if (targetBox.screws.length === targetBox.capacity) {
-                this.scheduleOnce(() => {
-                    this.clearBoxAndAssignNewColor(targetBox);
-                }, 0.2);
+                this.scheduleBoxClear(targetBox, 0.2);
             }
         }
         if (changed) {
             this.renderTopUI();
+            this.checkWin();
         }
     }
 
@@ -830,6 +809,215 @@ export class GameManager extends Component {
         return Array.from(colors);
     }
 
+    private isValidPrimaryBoxColor(color: BoxColor): color is ScrewColor {
+        return COLORS.indexOf(color as ScrewColor) !== -1;
+    }
+
+    private getPrimaryBoxFallbackColor(index: number): ScrewColor {
+        const remaining = this.getRemainingColors();
+        const otherPrimary = index === 0 ? this.boxes[1] : this.boxes[0];
+        const otherColor = otherPrimary && this.isValidPrimaryBoxColor(otherPrimary.color)
+            ? otherPrimary.color
+            : null;
+        const candidate = remaining.find((color) => color !== otherColor);
+        if (candidate) return candidate;
+        return COLORS[index] || ScrewColor.YELLOW;
+    }
+
+    private updateBoxColor(box: BoxData, color: BoxColor) {
+        if (box.color === color) return;
+        box.clearScheduled = false;
+        box.isSlidingOut = false;
+        box.color = color;
+        if (color === 'locked' || color === 'empty') {
+            box.screws = [];
+            return;
+        }
+        if (box.screws.some((screw) => screw !== color)) {
+            box.screws = [];
+        }
+    }
+
+    private getOutstandingColorCount(color: ScrewColor) {
+        let count = 0;
+        this.boxes.forEach((box) => {
+            count += box.screws.filter((screw) => screw === color).length;
+        });
+        this.tempHoles.forEach((tempColor) => {
+            if (tempColor === color) count++;
+        });
+        this.plates.forEach((plate) => {
+            if (plate.removed) return;
+            plate.screws.forEach((screw) => {
+                if (!screw.removed && screw.color === color) {
+                    count++;
+                }
+            });
+        });
+        return count;
+    }
+
+    private getPreferredRefreshColors() {
+        const weights = new Map<ScrewColor, number>();
+        const addWeight = (color: ScrewColor, weight: number) => {
+            weights.set(color, (weights.get(color) || 0) + weight);
+        };
+
+        this.tempHoles.forEach((color) => addWeight(color, 100));
+        this.plates.forEach((plate) => {
+            if (plate.removed) return;
+            plate.screws.forEach((screw) => {
+                if (screw.removed) return;
+                addWeight(screw.color, 1);
+                if (!this.isScrewBlocked(plate, screw)) {
+                    addWeight(screw.color, 20);
+                }
+            });
+        });
+
+        return Array.from(weights.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([color]) => color);
+    }
+
+    private pickRefreshColor(targetBox: BoxData): BoxColor {
+        const currentColors = this.boxes
+            .filter((box) => box !== targetBox && box.color !== 'locked' && box.color !== 'empty')
+            .map((box) => box.color as ScrewColor);
+
+        const preferred = this.getPreferredRefreshColors();
+        const preferredAvailable = preferred.filter((color) => currentColors.indexOf(color) === -1);
+        if (preferredAvailable.length > 0) {
+            return preferredAvailable[0];
+        }
+
+        const remaining = this.getRemainingColors().filter((color) => currentColors.indexOf(color) === -1);
+        if (remaining.length > 0) {
+            return remaining[0];
+        }
+
+        if (preferred.length > 0) {
+            return preferred[0];
+        }
+
+        return 'empty';
+    }
+
+    private getUniqueReplacementColor(exclude: BoxData, duplicateColor: ScrewColor): BoxColor {
+        const remaining = this.getRemainingColors().filter((color) => color !== duplicateColor);
+        const activeColors = this.boxes
+            .filter((box) => box !== exclude && box.color !== 'locked' && box.color !== 'empty')
+            .map((box) => box.color as ScrewColor);
+
+        const available = remaining.filter((color) => activeColors.indexOf(color) === -1);
+        if (available.length > 0) {
+            return available[0];
+        }
+
+        const fallback = COLORS.filter((color) => color !== duplicateColor && activeColors.indexOf(color) === -1);
+        if (fallback.length > 0) {
+            return fallback[0];
+        }
+
+        return 'empty';
+    }
+
+    private normalizeEndgameBoxes() {
+        const activeBoxes = this.boxes.filter((box): box is BoxData & { color: ScrewColor } => this.isValidPrimaryBoxColor(box.color));
+        const processed = new Set<ScrewColor>();
+
+        activeBoxes.forEach((box) => {
+            const color = box.color;
+            if (processed.has(color)) return;
+            processed.add(color);
+
+            const sameColorBoxes = this.boxes.filter((item) => item.color === color);
+            if (sameColorBoxes.length <= 1) return;
+
+            const outstandingCount = this.getOutstandingColorCount(color);
+            if (outstandingCount > box.capacity) return;
+
+            sameColorBoxes.sort((a, b) => b.screws.length - a.screws.length);
+            const primary = sameColorBoxes[0];
+            let mergedCount = 0;
+            sameColorBoxes.forEach((item) => {
+                mergedCount += item.screws.filter((screw) => screw === color).length;
+            });
+            primary.screws = Array(Math.min(primary.capacity, mergedCount)).fill(color);
+
+            for (let i = 1; i < sameColorBoxes.length; i++) {
+                const extraBox = sameColorBoxes[i];
+                extraBox.screws = [];
+                this.updateBoxColor(extraBox, this.getUniqueReplacementColor(extraBox, color));
+            }
+
+            if (this.canClearBox(primary)) {
+                this.scheduleBoxClear(primary, 0.2);
+            }
+        });
+    }
+
+    private canClearBox(box: BoxData) {
+        return this.isValidPrimaryBoxColor(box.color)
+            && box.screws.length === box.capacity
+            && box.screws.every((screw) => screw === box.color);
+    }
+
+    private scheduleBoxClear(box: BoxData, delay: number, withSuccessVibration: boolean = false) {
+        if (box.clearScheduled || !this.canClearBox(box)) return;
+
+        box.clearScheduled = true;
+        this.scheduleOnce(() => {
+            if (withSuccessVibration && this.canClearBox(box)) {
+                this.triggerVibration('success');
+            }
+            this.clearBoxAndAssignNewColor(box);
+        }, delay);
+    }
+
+    private ensurePrimaryBoxes() {
+        const firstTwo = this.boxes.slice(0, 2);
+        const active = firstTwo.filter((box) => this.isValidPrimaryBoxColor(box.color));
+        const missing = 2 - active.length;
+        if (missing <= 0) {
+            if (this.boxes[0].color === this.boxes[1].color) {
+                this.updateBoxColor(this.boxes[1], this.getPrimaryBoxFallbackColor(1));
+            }
+            return;
+        }
+
+        const remaining = this.getRemainingColors();
+        const used = new Set(active.map((box) => box.color as ScrewColor));
+        const fillColors = remaining.filter((color) => !used.has(color));
+
+        for (let i = 0; i < 2; i++) {
+            const box = this.boxes[i];
+            if (this.isValidPrimaryBoxColor(box.color)) continue;
+            const color = fillColors.shift() || remaining[0] || COLORS[i] || ScrewColor.YELLOW;
+            this.updateBoxColor(box, color);
+            box.screws = [];
+        }
+
+        if (this.boxes[0].color === this.boxes[1].color) {
+            this.updateBoxColor(this.boxes[1], this.getPrimaryBoxFallbackColor(1));
+        }
+    }
+
+    private reevaluateBoxColors() {
+        const remaining = this.getRemainingColors();
+        if (remaining.length === 0) return;
+
+        const activeBoxes = this.boxes.filter((box) => box.color !== 'locked' && box.color !== 'empty');
+        const missingColors = remaining.filter((color) => !activeBoxes.some((box) => box.color === color));
+        if (missingColors.length === 0) return;
+
+        const emptyActiveBoxes = activeBoxes.filter((box) => box.screws.length === 0);
+        if (emptyActiveBoxes.length > 0) {
+            this.updateBoxColor(emptyActiveBoxes[0], missingColors[0]);
+            this.scheduleOnce(() => this.autoFillFromTemp(), 0.1);
+        }
+    }
+
     private handleUnlockBox(targetBox: BoxData) {
         if (this.gameOver || targetBox.color !== 'locked') return;
 
@@ -841,7 +1029,7 @@ export class GameManager extends Component {
         }
 
         if (available.length > 0) {
-            targetBox.color = available[Math.floor(Math.random() * available.length)];
+            this.updateBoxColor(targetBox, available[Math.floor(Math.random() * available.length)]);
             targetBox.isNew = true;
             this.renderTopUI();
             this.autoFillFromTemp();
@@ -864,9 +1052,7 @@ export class GameManager extends Component {
             this.tryConsumeTool(type, () => {
                 visible.sort((a, b) => b.layer - a.layer);
                 const target = visible[0];
-                target.removed = true;
-                this.renderBoard();
-                this.checkWin();
+                this.startPlateFalling(target);
             });
             return;
         }
@@ -880,6 +1066,7 @@ export class GameManager extends Component {
                 }
             });
             this.tempHoles = [];
+            this.reevaluateBoxColors();
             this.renderTopUI();
         });
     }
@@ -892,8 +1079,36 @@ export class GameManager extends Component {
         this.renderTools();
     }
 
+    private startPlateFalling(plate: PlateData) {
+        if (plate.removed || plate.isFalling || !this.boardEffectNode) return;
+
+        const fallingNode = this.createPlateNode(this.boardEffectNode, plate, false);
+
+        if (!fallingNode) return;
+
+        plate.removed = true;
+        plate.isFalling = true;
+        this.destroyPlateNode(plate.id);
+        this.fallingPlateNodes.set(plate.id, fallingNode);
+
+        tween(fallingNode)
+            .to(1.2, { position: new Vec3(fallingNode.position.x, fallingNode.position.y - 800, 0) }, { easing: 'quadIn' })
+            .call(() => {
+                this.triggerVibration('success');
+                plate.isFalling = false;
+                const activeNode = this.fallingPlateNodes.get(plate.id);
+                if (activeNode && activeNode.isValid) {
+                    activeNode.destroy();
+                }
+                this.fallingPlateNodes.delete(plate.id);
+                this.checkWin();
+            })
+            .start();
+    }
+
     private checkWin() {
         if (this.gameOver) return;
+        if (this.fallingPlateNodes.size > 0) return;
         const allRemoved = this.plates.every((plate) => plate.removed);
         if (!allRemoved || this.tempHoles.length > 0) return;
 
@@ -964,11 +1179,233 @@ export class GameManager extends Component {
 
     private createNode(name: string, parent: Node, x: number, y: number, width: number, height: number) {
         const node = new Node(name);
+        node.layer = Layers.Enum.UI_2D;
         const transform = node.addComponent(UITransform);
         transform.setContentSize(width, height);
         node.setPosition(new Vec3(x, y, 0));
         parent.addChild(node);
         return node;
+    }
+
+    private createPlateNode(parent: Node, plate: PlateData, interactive: boolean, angleOverride?: number) {
+        let pivotX = plate.x;
+        let pivotY = plate.y;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        if (plate.gravityOrigin) {
+            offsetX = plate.gravityOrigin.x - plate.w / 2;
+            offsetY = plate.h / 2 - plate.gravityOrigin.y;
+            pivotX = plate.x + offsetX;
+            pivotY = plate.y + offsetY;
+        }
+
+        const pivotNode = this.createNode(`Pivot_${plate.id}`, parent, pivotX, pivotY, 0, 0);
+        pivotNode.angle = angleOverride ?? (plate.rotation || 0);
+        if (interactive) {
+            this.plateNodes.set(plate.id, pivotNode);
+            pivotNode.setSiblingIndex(Math.max(0, this.getPlateSiblingIndex(plate.id)));
+        }
+
+        const plateNode = this.createNode(`PlateVisual_${plate.id}`, pivotNode, -offsetX, -offsetY, plate.w, plate.h);
+
+        const shadow = this.createGraphicsNode('Shadow', plateNode, plate.w + 6, plate.h + 6, 6, -6);
+        this.drawPlateShape(shadow.getComponent(Graphics)!, plate.type, plate.w + 6, plate.h + 6, new Color(162, 176, 190, 105), 24, 0);
+
+        const face = this.createGraphicsNode('Face', plateNode, plate.w, plate.h, 0, 0);
+        this.drawPlateShape(face.getComponent(Graphics)!, plate.type, plate.w, plate.h, FACE_COLORS[plate.color], 22, 5, new Color(245, 248, 250, 230));
+
+        plate.screws.filter((screw) => !screw.removed).forEach((screw) => {
+            const screwSize = 34;
+            const localX = -plate.w / 2 + screw.x;
+            const localY = plate.h / 2 - screw.y;
+
+            const screwContainer = this.createNode(`ScrewContainer_${screw.id}`, plateNode, localX, localY, screwSize, screwSize);
+
+            const holeShadow = this.createGraphicsNode('Hole', screwContainer, screwSize, screwSize, 0, 0);
+            this.drawCircle(holeShadow.getComponent(Graphics)!, screwSize / 2, new Color(0, 0, 0, 40), 0);
+
+            const screwNode = this.createScrewVisual(screwContainer, 0, 0, screwSize, screw.color, true);
+            if (interactive) {
+                screwNode.on(Node.EventType.TOUCH_END, (e) => {
+                    e.propagationStopped = true;
+                    this.handleScrewClick(plate, screw);
+                }, this);
+            }
+        });
+
+        return pivotNode;
+    }
+
+    private refreshPlateNode(plate: PlateData, angleOverride?: number) {
+        if (!this.boardContentNode || plate.removed) return null;
+        this.destroyPlateNode(plate.id);
+        return this.createPlateNode(this.boardContentNode, plate, true, angleOverride);
+    }
+
+    private destroyPlateNode(plateId: string) {
+        const node = this.plateNodes.get(plateId);
+        if (node && node.isValid) {
+            node.destroy();
+        }
+        this.plateNodes.delete(plateId);
+    }
+
+    private getPlateSiblingIndex(plateId: string) {
+        return this.plates
+            .filter((plate) => !plate.removed)
+            .sort((a, b) => a.layer - b.layer)
+            .findIndex((plate) => plate.id === plateId);
+    }
+
+    private updateScrewHost(host: Node, diameter: number, color?: ScrewColor) {
+        const existing = host.children[0];
+        const expectedName = color ? `ScrewVisual_${color}` : '';
+        if (!color) {
+            if (existing) {
+                host.removeAllChildren();
+            }
+            return;
+        }
+
+        if (existing && existing.name === expectedName) {
+            return;
+        }
+
+        host.removeAllChildren();
+        this.createScrewVisual(host, 0, 0, diameter, color, false);
+    }
+
+    private getBoxSlotPositions() {
+        return [
+            { x: -16, y: 13 },
+            { x: 16, y: 13 },
+            { x: 0, y: -12 }
+        ];
+    }
+
+    private ensureBoxViews() {
+        if (!this.boxesContainerNode || this.boxViews.length === this.boxes.length) return;
+
+        const boxWidth = Math.min(84, this.screenWidth * 0.2);
+        const boxHeight = 92;
+        const gap = (this.screenWidth - 40 - boxWidth * 4) / 3;
+        const startX = -((boxWidth * 4 + gap * 3) / 2) + boxWidth / 2;
+        const slotPositions = this.getBoxSlotPositions();
+
+        while (this.boxViews.length < this.boxes.length) {
+            const index = this.boxViews.length;
+            const x = startX + index * (boxWidth + gap);
+            const boxNode = this.createNode(`Box_${index}`, this.boxesContainerNode, x, 0, boxWidth, boxHeight);
+
+            const backLayer = this.createGraphicsNode('BackLayer', boxNode, boxWidth + 8, boxHeight + 8, 5, -4);
+            this.drawRoundedRect(backLayer.getComponent(Graphics)!, boxWidth + 8, boxHeight + 8, new Color(198, 208, 220, 170), 12);
+
+            const shadow = this.createGraphicsNode('Shadow', boxNode, boxWidth + 6, boxHeight + 6, 2, -2);
+            this.drawRoundedRect(shadow.getComponent(Graphics)!, boxWidth + 6, boxHeight + 6, new Color(210, 218, 228, 120), 12);
+
+            const body = this.createGraphicsNode('Body', boxNode, boxWidth, boxHeight, 0, 0);
+            const bodyGraphics = body.getComponent(Graphics)!;
+
+            const lockLabel = this.createLabel(boxNode, '解锁\n盒子', 0, 0, 15, new Color(255, 255, 255, 255), true, 19);
+            lockLabel.node.active = false;
+
+            const slots: BoxSlotView[] = slotPositions.map((pos, slotIndex) => {
+                const slotNode = this.createNode(`SlotWrap_${slotIndex}`, boxNode, pos.x, pos.y, 24, 24);
+                const holeNode = this.createGraphicsNode(`Slot_${slotIndex}`, slotNode, 24, 24, 0, 0);
+                const hole = holeNode.getComponent(Graphics)!;
+                this.drawCircle(hole, 12, new Color(0, 0, 0, 35), 0);
+                const screwHost = this.createNode(`ScrewHost_${slotIndex}`, slotNode, 0, 0, 24, 24);
+                return { node: slotNode, hole, screwHost };
+            });
+
+            boxNode.on(Node.EventType.TOUCH_END, () => {
+                const box = this.boxes[index];
+                if (box && box.color === 'locked') {
+                    this.handleUnlockBox(box);
+                }
+            }, this);
+
+            this.boxViews.push({
+                node: boxNode,
+                body: bodyGraphics,
+                lockLabel,
+                slots
+            });
+        }
+    }
+
+    private ensureTempSlotViews() {
+        if (!this.tempContainerNode) return;
+
+        if (!this.tempBgGraphics) {
+            const containerW = this.screenWidth - 154;
+            const containerH = 30;
+            const bgNode = this.createGraphicsNode('TempBg', this.tempContainerNode, containerW, containerH, 0, 0);
+            this.tempBgGraphics = bgNode.getComponent(Graphics)!;
+        }
+
+        if (this.tempSlotViews.length === this.maxTempHoles) return;
+
+        const slotRadius = 12;
+        const spacing = slotRadius * 2 + 5;
+        const startX = -spacing * 2;
+        while (this.tempSlotViews.length < this.maxTempHoles) {
+            const index = this.tempSlotViews.length;
+            const slotNode = this.createNode(`TempSlotWrap_${index}`, this.tempContainerNode, startX + index * spacing, 0, slotRadius * 2, slotRadius * 2);
+            const holeNode = this.createGraphicsNode(`TempSlot_${index}`, slotNode, slotRadius * 2, slotRadius * 2, 0, 0);
+            const hole = holeNode.getComponent(Graphics)!;
+            this.drawCircle(hole, slotRadius, new Color(202, 206, 212, 255), 0);
+            const screwHost = this.createNode(`TempScrewHost_${index}`, slotNode, 0, 0, slotRadius * 2, slotRadius * 2);
+            this.tempSlotViews.push({ node: slotNode, hole, screwHost });
+        }
+    }
+
+    private ensureToolViews() {
+        if (!this.toolContainerNode || this.toolViews.length > 0) return;
+
+        const toolList = [
+            { key: 'add' as const, label: '加孔位', icon: '🔍' },
+            { key: 'break' as const, label: '熔玻璃', icon: '🔨' },
+            { key: 'clear' as const, label: '清空孔位', icon: '🧹' }
+        ];
+        const buttonWidth = 74;
+        const buttonHeight = 82;
+        const gap = (this.screenWidth - 40 - buttonWidth * 3) / 2;
+        const startX = -((buttonWidth * 3 + gap * 2) / 2) + buttonWidth / 2;
+        const badgeX = buttonWidth / 2 - 6;
+        const badgeY = buttonHeight / 2 - 6;
+
+        toolList.forEach((tool, index) => {
+            const x = startX + index * (buttonWidth + gap);
+            const btnNode = this.createNode(`ToolBtn_${tool.key}`, this.toolContainerNode!, x, 0, buttonWidth, buttonHeight);
+
+            const shadow = this.createGraphicsNode('Shadow', btnNode, buttonWidth + 6, buttonHeight + 6, 0, -2);
+            this.drawRoundedRect(shadow.getComponent(Graphics)!, buttonWidth + 6, buttonHeight + 6, new Color(201, 218, 234, 255), 18);
+
+            const body = this.createGraphicsNode('Body', btnNode, buttonWidth, buttonHeight, 0, 0);
+            this.drawRoundedRect(body.getComponent(Graphics)!, buttonWidth, buttonHeight, new Color(138, 77, 232, 255), 16, 5, new Color(175, 133, 240, 255));
+
+            const iconLabel = this.createLabel(btnNode, tool.icon, 0, 8, 28, new Color(255, 255, 255, 255), false, 32);
+            iconLabel.enableWrapText = false;
+            this.createLabel(btnNode, tool.label, 0, -22, 15, new Color(255, 255, 255, 255), true);
+
+            const badgeNode = this.createGraphicsNode('Badge', btnNode, 26, 26, badgeX, badgeY);
+            const badge = badgeNode.getComponent(Graphics)!;
+            const badgeLabel = this.createLabel(btnNode, '+', badgeX, badgeY, 18, new Color(255, 255, 255, 255), true);
+
+            btnNode.on(Node.EventType.TOUCH_END, () => {
+                this.useTool(tool.key);
+            }, this);
+
+            this.toolViews.push({
+                key: tool.key,
+                node: btnNode,
+                iconLabel,
+                badge,
+                badgeLabel
+            });
+        });
     }
 
     private createGraphicsNode(name: string, parent: Node, width: number, height: number, x: number, y: number) {
@@ -998,6 +1435,36 @@ export class GameManager extends Component {
         return node;
     }
 
+    private triggerVibration(type: 'light' | 'heavy' | 'success' = 'light') {
+        const wxApi = (globalThis as any).wx;
+        if (wxApi && typeof wxApi.vibrateShort === 'function') {
+            try {
+                if (type === 'success') {
+                    wxApi.vibrateShort({});
+                    setTimeout(() => wxApi.vibrateShort({}), 70);
+                } else if (type === 'heavy') {
+                    wxApi.vibrateShort({ type: 'heavy' });
+                } else {
+                    wxApi.vibrateShort({});
+                }
+                return;
+            } catch (_) {
+                // ignore and fallback below
+            }
+        }
+
+        const nav = (globalThis as any).navigator;
+        if (nav && typeof nav.vibrate === 'function') {
+            if (type === 'success') {
+                nav.vibrate([35, 40, 35]);
+            } else if (type === 'heavy') {
+                nav.vibrate(45);
+            } else {
+                nav.vibrate(20);
+            }
+        }
+    }
+
     private createSettingsButton(parent: Node, x: number, y: number, width: number, height: number) {
         const node = this.createNode('SettingsButton', parent, x, y, width, height);
         const bg = this.createGraphicsNode('Bg', node, width, height, 0, 0);
@@ -1016,23 +1483,28 @@ export class GameManager extends Component {
         return node;
     }
 
-    private createScrewVisual(parent: Node, x: number, y: number, size: number, color: ScrewColor, clickable: boolean) {
-        const node = this.createNode('Screw', parent, x, y, size + 8, size + 8);
-        const shadow = this.createGraphicsNode('Shadow', node, size + 4, size + 4, 0, -4);
-        this.drawCircle(shadow.getComponent(Graphics)!, (size + 4) / 2, new Color(71, 58, 66, 80), 0);
+    private createScrewVisual(parent: Node, x: number, y: number, diameter: number, color: ScrewColor, addShadow: boolean = true): Node {
+        const screwNode = this.createNode(`ScrewVisual_${color}`, parent, x, y, diameter, diameter);
 
-        const face = this.createGraphicsNode('Face', node, size, size, 0, 0);
-        this.drawCircle(face.getComponent(Graphics)!, size / 2, SCREW_FACE_COLORS[color], 3, new Color(255, 255, 255, 90));
-
-        this.createLabel(node, '+', 0, -1, Math.floor(size * 0.52), color === ScrewColor.YELLOW ? new Color(109, 85, 32, 255) : new Color(66, 23, 31, 255), true);
-
-        if (clickable) {
-            const hit = node.getComponent(UITransform);
-            if (hit) {
-                hit.setContentSize(size + 14, size + 14);
-            }
+        if (addShadow) {
+            const shadow = this.createGraphicsNode('Shadow', screwNode, diameter, diameter, 0, -4);
+            this.drawCircle(shadow.getComponent(Graphics)!, diameter / 2, new Color(0, 0, 0, 60), 0);
         }
-        return node;
+
+        const body = this.createGraphicsNode('Body', screwNode, diameter - 2, diameter - 2, 0, 0);
+        this.drawCircle(body.getComponent(Graphics)!, (diameter - 2) / 2, SCREW_FACE_COLORS[color], 2, new Color(248, 244, 235, 245));
+
+        const innerBody = this.createGraphicsNode('InnerBody', screwNode, diameter - 8, diameter - 8, 0, 1);
+        this.drawCircle(innerBody.getComponent(Graphics)!, (diameter - 8) / 2, BOX_COLORS[color], 1, new Color(255, 255, 255, 80));
+
+        const highlight = this.createGraphicsNode('Highlight', screwNode, Math.max(8, diameter * 0.34), Math.max(8, diameter * 0.22), -diameter * 0.12, diameter * 0.14);
+        this.drawCircle(highlight.getComponent(Graphics)!, Math.max(4, diameter * 0.11), new Color(255, 255, 255, 70), 0);
+
+        const crossColor = color === ScrewColor.YELLOW ? new Color(104, 82, 28, 220) : new Color(74, 33, 40, 220);
+        const cross = this.createLabel(screwNode, '+', 0, 1, diameter - 10, crossColor, true, diameter);
+        cross.getComponent(Label)!.isBold = true;
+
+        return screwNode;
     }
 
     private drawRoundedRect(graphics: Graphics, width: number, height: number, fill: Color, radius: number, lineWidth = 0, stroke?: Color) {
@@ -1070,16 +1542,7 @@ export class GameManager extends Component {
         this.drawRoundedRect(graphics, width, height, fill, radius, lineWidth, stroke);
     }
 
-    private getBoxColor(color: BoxColor) {
-        if (color === 'empty' || color === 'locked') {
-            return new Color(255, 255, 255, 255);
-        }
-        const faceColor = SCREW_FACE_COLORS[color];
-        return new Color(
-            Math.min(255, faceColor.r + 18),
-            Math.min(255, faceColor.g + 22),
-            Math.min(255, faceColor.b + 18),
-            255
-        );
+    private getBoxColor(color: BoxColor): Color {
+        return BOX_COLORS[color] || new Color(200, 200, 200, 255);
     }
 }
