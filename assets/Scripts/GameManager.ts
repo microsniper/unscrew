@@ -1,7 +1,8 @@
-import { _decorator, Component, Node, Vec3, UITransform, Label, Color, tween, Graphics, director, Canvas, Mask, screen, ResolutionPolicy, Layers } from 'cc';
+import { _decorator, Component, Node, Vec3, UITransform, Label, Color, tween, Graphics, director, Canvas, Widget, Mask, screen, ResolutionPolicy, Layers } from 'cc';
 import { loginAndGetProgress, saveProgress } from './api';
 
 const { ccclass } = _decorator;
+void Widget;
 
 export enum ScrewColor {
     RED = 'red',
@@ -44,10 +45,28 @@ interface PlateData {
     screws: ScrewData[];
     holes: { x: number; y: number }[];
     removed: boolean;
+    state?: 'stable' | 'falling' | 'supported' | 'removed';
+    supportPlateId?: string;
+    supportY?: number;
     isFalling?: boolean;
     fallDistance?: number;
     rotation?: number;
     gravityOrigin?: { x: number; y: number };
+}
+
+interface PlateBottomSample {
+    localX: number;
+    localY: number;
+    worldX: number;
+    worldY: number;
+}
+
+interface PlateSupportCandidate {
+    plate: PlateData;
+    dropDistance: number;
+    supportRatio: number;
+    continuousSamples: number;
+    targetY: number;
 }
 
 interface BoxData {
@@ -135,6 +154,13 @@ const SCREW_FACE_COLORS: Record<ScrewColor, Color> = {
 
 const PAGE_CONTENT_SCALE = 0.9;
 const TOP_CONTENT_OFFSET = 24;
+const SUPPORT_SAMPLE_COUNT = 21;
+const SUPPORT_RATIO_THRESHOLD = 0.3;
+const SUPPORT_MIN_CONTINUOUS_SAMPLES = 6;
+const SUPPORT_CONTACT_TOLERANCE = 3;
+const SUPPORT_MIN_DROP_DISTANCE = 6;
+const SUPPORT_SURFACE_SCAN_STEP = 4;
+const SUPPORT_SURFACE_REFINE_ITERATIONS = 8;
 
 @ccclass('GameManager')
 export class GameManager extends Component {
@@ -338,6 +364,10 @@ export class GameManager extends Component {
             { color: 'locked', capacity: 3, screws: [], isNew: false, isSlidingOut: false, clearScheduled: false }
         ];
         this.generateLevel();
+        
+        this.boxes[0].capacity = this.getNextCapacityForColor(this.boxes[0].color, this.boxes[0]);
+        this.boxes[1].capacity = this.getNextCapacityForColor(this.boxes[1].color, this.boxes[1]);
+        
         this.ensurePrimaryBoxes();
         this.renderAll();
     }
@@ -392,16 +422,32 @@ export class GameManager extends Component {
 
             const isLocked = box.color === 'locked';
             view.lockLabel.node.active = isLocked;
+            const boxCapacity = box.capacity || 3;
+            const screwSize = boxCapacity >= 6 ? 20 : (boxCapacity >= 5 ? 22 : (boxCapacity >= 4 ? 24 : 26));
+            const boxSlots = this.getBoxSlotPositions(boxCapacity);
+
             view.slots.forEach((slotView, slotIndex) => {
-                slotView.node.active = !isLocked;
+                const active = slotIndex < boxCapacity;
+                slotView.node.active = active && !isLocked;
+
+                const slotPos = boxSlots[slotIndex];
+                if (slotPos) {
+                    slotView.node.setPosition(new Vec3(slotPos.x, slotPos.y, 0));
+                }
+
+                if (!active) {
+                    this.updateScrewHost(slotView.screwHost, screwSize);
+                    return;
+                }
+
                 if (isLocked) {
-                    this.updateScrewHost(slotView.screwHost, 26);
+                    this.updateScrewHost(slotView.screwHost, screwSize);
                     return;
                 }
 
                 const screwColor = box.color === 'empty' ? undefined : box.screws[slotIndex];
                 slotView.hole.node.active = !screwColor;
-                this.updateScrewHost(slotView.screwHost, 26, screwColor);
+                this.updateScrewHost(slotView.screwHost, screwSize, screwColor);
             });
 
             if (box.isNew) {
@@ -534,6 +580,18 @@ export class GameManager extends Component {
             availableTemplates = PLATE_TEMPLATES.filter((template) => template.holes.length >= 3);
         }
 
+        // 高难度下动态加入“长条恶心板”模板
+        if (levelNum > 5) {
+            const barProbability = Math.min(0.3, (levelNum - 5) * 0.05);
+            if (Math.random() < barProbability) {
+                const isHorizontal = Math.random() > 0.5;
+                const barTemplate = isHorizontal
+                    ? { type: 'rect' as const, w: 280, h: 70, holes: [{ x: 40, y: 35 }, { x: 140, y: 35 }, { x: 240, y: 35 }] }
+                    : { type: 'rect' as const, w: 70, h: 280, holes: [{ x: 35, y: 40 }, { x: 35, y: 140 }, { x: 35, y: 240 }] };
+                availableTemplates = [...availableTemplates, barTemplate];
+            }
+        }
+
         const spreadFactor = Math.max(0.62, 1.16 - levelNum * 0.07);
         const rangeX = 168 * spreadFactor;
         const rangeY = 228 * spreadFactor;
@@ -592,9 +650,29 @@ export class GameManager extends Component {
 
             const actualHoles = template.holes.map((hole) => {
                 if (rotation === 90) {
-                    return { x: hole.y * template.h, y: (1 - hole.x) * template.w };
+                    // 对于标准化坐标 (x,y 在 0~1 之间)，旋转 90 度的映射是 x'=y, y'=1-x
+                    // 但我们在添加长条板时，传入的是实际像素坐标，而不是 0~1 的比例！
+                    // 为了兼容旧的 PLATE_TEMPLATES (0~1比例) 和新的长条板 (实际像素)，这里需要做区分
+                    const isRatio = template.holes[0].x <= 1 && template.holes[0].y <= 1;
+                    if (isRatio) {
+                        return { x: hole.y * template.h, y: (1 - hole.x) * template.w };
+                    } else {
+                        // 已经是实际像素，旋转 90 度: 以中心点 (w/2, h/2) 旋转
+                        const cx = template.w / 2;
+                        const cy = template.h / 2;
+                        const dx = hole.x - cx;
+                        const dy = hole.y - cy;
+                        // 旋转后中心点变成了 (h/2, w/2)
+                        return { x: template.h / 2 - dy, y: template.w / 2 + dx };
+                    }
                 }
-                return { x: hole.x * template.w, y: hole.y * template.h };
+                
+                const isRatio = template.holes[0].x <= 1 && template.holes[0].y <= 1;
+                if (isRatio) {
+                    return { x: hole.x * template.w, y: hole.y * template.h };
+                } else {
+                    return { x: hole.x, y: hole.y }; // 已经是像素坐标，直接返回
+                }
             });
 
             this.plates.push({
@@ -609,6 +687,9 @@ export class GameManager extends Component {
                 screws: [],
                 holes: actualHoles,
                 removed: false,
+                state: 'stable',
+                supportPlateId: undefined,
+                supportY: undefined,
                 isFalling: false,
                 fallDistance: 0,
                 rotation: 0
@@ -628,6 +709,7 @@ export class GameManager extends Component {
         screwsToPlace.forEach((color, index) => {
             const target = allAvailableHoles.pop();
             if (!target) return;
+
             const hole = target.plate.holes[target.holeIndex];
             target.plate.screws.push({
                 id: `s_${index}`,
@@ -640,6 +722,82 @@ export class GameManager extends Component {
 
         this.plates = this.plates.filter((plate) => plate.screws.length > 0);
         this.plates.forEach((plate) => this.updatePlateGravity(plate));
+    }
+
+    private getAvailableScrewsForNewBox(color: ScrewColor, targetBox: BoxData): number {
+        const totalOutstanding = this.getOutstandingColorCount(color);
+        let reservedByOthers = 0;
+
+        this.boxes.forEach((box) => {
+            if (box !== targetBox && box.color === color) {
+                reservedByOthers += box.capacity;
+            }
+        });
+
+        return totalOutstanding - reservedByOthers;
+    }
+
+    private getNextCapacityForColor(color: BoxColor, targetBox: BoxData, minCapacity: number = 3): number {
+        if (color === 'empty' || color === 'locked') return 3;
+
+        const remaining = this.getAvailableScrewsForNewBox(color as ScrewColor, targetBox);
+        const normalizedMinCapacity = Math.max(3, Math.min(6, minCapacity));
+        const validCaps: number[] = [];
+        for (const c of [3, 4, 5, 6]) {
+            if (c < normalizedMinCapacity || c > remaining) continue;
+            if (remaining - c === 0 || remaining - c >= 3) {
+                validCaps.push(c);
+            }
+        }
+
+        if (validCaps.length === 0) {
+            return Math.max(normalizedMinCapacity, Math.min(remaining, 6));
+        }
+
+        const desired = this.getBoxCapacity();
+        if (validCaps.indexOf(desired) !== -1) {
+            return desired;
+        }
+
+        return validCaps[Math.floor(Math.random() * validCaps.length)];
+    }
+
+    private checkAllBoxesForClear() {
+        let changed = false;
+        this.boxes.forEach((box) => {
+            if (this.canClearBox(box)) {
+                if (!box.clearScheduled) {
+                    this.scheduleBoxClear(box, 0.2);
+                    changed = true;
+                }
+            }
+        });
+        return changed;
+    }
+
+    private getBoxCapacity(): number {
+        const level = this.currentLevel;
+        if (level <= 6) return 3;
+        if (level <= 11) return Math.random() < 0.15 ? 4 : 3;
+        if (level <= 16) return Math.random() < 0.35 ? 4 : 3;
+        if (level <= 21) {
+            const r = Math.random();
+            return r < 0.15 ? 5 : (r < 0.50 ? 4 : 3);
+        }
+        if (level <= 27) {
+            const r = Math.random();
+            return r < 0.25 ? 5 : (r < 0.60 ? 4 : 3);
+        }
+        if (level <= 35) {
+            const r = Math.random();
+            return r < 0.10 ? 6 : (r < 0.40 ? 5 : (r < 0.75 ? 4 : 3));
+        }
+        if (level <= 45) {
+            const r = Math.random();
+            return r < 0.15 ? 6 : (r < 0.50 ? 5 : (r < 0.85 ? 4 : 3));
+        }
+        const r = Math.random();
+        return r < 0.25 ? 6 : (r < 0.60 ? 5 : (r < 0.90 ? 4 : 3));
     }
 
     private updatePlateGravity(plate: PlateData) {
@@ -718,14 +876,22 @@ export class GameManager extends Component {
 
         this.renderTopUI();
 
-        if (targetBox && targetBox.screws.length === targetBox.capacity) {
+        if (targetBox && this.canClearBox(targetBox)) {
             this.scheduleBoxClear(targetBox, 0.25, true);
         }
 
         const remaining = plate.screws.filter((item) => !item.removed);
         if (remaining.length === 0) {
+            plate.state = 'stable';
+            plate.supportPlateId = undefined;
+            plate.supportY = undefined;
+            const currentAngle = plate.rotation || 0;
+            this.refreshPlateNode(plate, currentAngle);
             this.startPlateFalling(plate);
         } else {
+            plate.state = 'stable';
+            plate.supportPlateId = undefined;
+            plate.supportY = undefined;
             const oldRotation = plate.rotation || 0;
             this.updatePlateGravity(plate);
             const plateNode = this.refreshPlateNode(plate, oldRotation);
@@ -740,6 +906,7 @@ export class GameManager extends Component {
                 }
             }
 
+            this.checkAllBoxesForClear();
             this.checkWin();
         }
     }
@@ -768,6 +935,7 @@ export class GameManager extends Component {
 
             const nextColor = this.pickRefreshColor(targetBox);
             this.updateBoxColor(targetBox, nextColor);
+            targetBox.capacity = this.getNextCapacityForColor(nextColor, targetBox);
             targetBox.isNew = nextColor !== 'empty';
             this.renderTopUI();
             this.autoFillFromTemp();
@@ -785,13 +953,19 @@ export class GameManager extends Component {
             this.tempHoles.splice(i, 1);
             changed = true;
 
-            if (targetBox.screws.length === targetBox.capacity) {
+            if (this.canClearBox(targetBox)) {
                 this.scheduleBoxClear(targetBox, 0.2);
             }
         }
         if (changed) {
             this.renderTopUI();
             this.checkWin();
+        } else {
+            // 如果自动填充没有触发任何盒子消除，检查是否有天然死盒
+            if (this.checkAllBoxesForClear()) {
+                this.renderTopUI();
+                this.checkWin();
+            }
         }
     }
 
@@ -948,7 +1122,9 @@ export class GameManager extends Component {
             for (let i = 1; i < sameColorBoxes.length; i++) {
                 const extraBox = sameColorBoxes[i];
                 extraBox.screws = [];
-                this.updateBoxColor(extraBox, this.getUniqueReplacementColor(extraBox, color));
+                const newColor = this.getUniqueReplacementColor(extraBox, color);
+                this.updateBoxColor(extraBox, newColor);
+                extraBox.capacity = this.getNextCapacityForColor(newColor, extraBox);
             }
 
             if (this.canClearBox(primary)) {
@@ -958,9 +1134,14 @@ export class GameManager extends Component {
     }
 
     private canClearBox(box: BoxData) {
-        return this.isValidPrimaryBoxColor(box.color)
-            && box.screws.length === box.capacity
-            && box.screws.every((screw) => screw === box.color);
+        if (!this.isValidPrimaryBoxColor(box.color) || box.screws.length === 0) return false;
+        if (!box.screws.every((screw) => screw === box.color)) return false;
+
+        if (box.screws.length === box.capacity) return true;
+
+        if (box.screws.length === this.getOutstandingColorCount(box.color)) return true;
+
+        return false;
     }
 
     private scheduleBoxClear(box: BoxData, delay: number, withSuccessVibration: boolean = false) {
@@ -982,6 +1163,7 @@ export class GameManager extends Component {
         if (missing <= 0) {
             if (this.boxes[0].color === this.boxes[1].color) {
                 this.updateBoxColor(this.boxes[1], this.getPrimaryBoxFallbackColor(1));
+                this.boxes[1].capacity = this.getNextCapacityForColor(this.boxes[1].color, this.boxes[1]);
             }
             return;
         }
@@ -996,10 +1178,12 @@ export class GameManager extends Component {
             const color = fillColors.shift() || remaining[0] || COLORS[i] || ScrewColor.YELLOW;
             this.updateBoxColor(box, color);
             box.screws = [];
+            box.capacity = this.getNextCapacityForColor(box.color, box);
         }
 
         if (this.boxes[0].color === this.boxes[1].color) {
             this.updateBoxColor(this.boxes[1], this.getPrimaryBoxFallbackColor(1));
+            this.boxes[1].capacity = this.getNextCapacityForColor(this.boxes[1].color, this.boxes[1]);
         }
     }
 
@@ -1014,6 +1198,7 @@ export class GameManager extends Component {
         const emptyActiveBoxes = activeBoxes.filter((box) => box.screws.length === 0);
         if (emptyActiveBoxes.length > 0) {
             this.updateBoxColor(emptyActiveBoxes[0], missingColors[0]);
+            emptyActiveBoxes[0].capacity = this.getNextCapacityForColor(missingColors[0], emptyActiveBoxes[0]);
             this.scheduleOnce(() => this.autoFillFromTemp(), 0.1);
         }
     }
@@ -1029,7 +1214,9 @@ export class GameManager extends Component {
         }
 
         if (available.length > 0) {
-            this.updateBoxColor(targetBox, available[Math.floor(Math.random() * available.length)]);
+            const nextColor = available[Math.floor(Math.random() * available.length)];
+            this.updateBoxColor(targetBox, nextColor);
+            targetBox.capacity = this.getNextCapacityForColor(nextColor, targetBox);
             targetBox.isNew = true;
             this.renderTopUI();
             this.autoFillFromTemp();
@@ -1047,12 +1234,12 @@ export class GameManager extends Component {
         }
 
         if (type === 'break') {
-            const visible = this.plates.filter((plate) => !plate.removed);
+            const visible = this.plates.filter((plate) => !plate.removed && plate.state !== 'falling');
             if (visible.length === 0) return;
             this.tryConsumeTool(type, () => {
                 visible.sort((a, b) => b.layer - a.layer);
                 const target = visible[0];
-                this.startPlateFalling(target);
+                this.startPlateFalling(target, true);
             });
             return;
         }
@@ -1067,7 +1254,9 @@ export class GameManager extends Component {
             });
             this.tempHoles = [];
             this.reevaluateBoxColors();
+            this.checkAllBoxesForClear();
             this.renderTopUI();
+            this.checkWin();
         });
     }
 
@@ -1079,36 +1268,16 @@ export class GameManager extends Component {
         this.renderTools();
     }
 
-    private startPlateFalling(plate: PlateData) {
-        if (plate.removed || plate.isFalling || !this.boardEffectNode) return;
+    private startPlateFalling(plate: PlateData, forceDropOut = false) {
+        if (plate.removed || plate.state === 'falling') return;
+        if (!forceDropOut && this.hasRemainingScrews(plate)) return;
 
-        const fallingNode = this.createPlateNode(this.boardEffectNode, plate, false);
-
-        if (!fallingNode) return;
-
-        plate.removed = true;
-        plate.isFalling = true;
-        this.destroyPlateNode(plate.id);
-        this.fallingPlateNodes.set(plate.id, fallingNode);
-
-        tween(fallingNode)
-            .to(1.2, { position: new Vec3(fallingNode.position.x, fallingNode.position.y - 800, 0) }, { easing: 'quadIn' })
-            .call(() => {
-                this.triggerVibration('success');
-                plate.isFalling = false;
-                const activeNode = this.fallingPlateNodes.get(plate.id);
-                if (activeNode && activeNode.isValid) {
-                    activeNode.destroy();
-                }
-                this.fallingPlateNodes.delete(plate.id);
-                this.checkWin();
-            })
-            .start();
+        this.dropPlateOutOfScene(plate);
     }
 
     private checkWin() {
         if (this.gameOver) return;
-        if (this.fallingPlateNodes.size > 0) return;
+        if (this.fallingPlateNodes.size > 0 || this.plates.some((plate) => plate.state === 'falling')) return;
         const allRemoved = this.plates.every((plate) => plate.removed);
         if (!allRemoved || this.tempHoles.length > 0) return;
 
@@ -1125,56 +1294,185 @@ export class GameManager extends Component {
         });
     }
 
+    private readonly SCREW_BLOCK_COVERAGE = 0.3;
+
     private isScrewBlocked(plate: PlateData, screw: ScrewData) {
-        const screwAbsX = plate.x - plate.w / 2 + screw.x;
-        const screwAbsY = plate.y + plate.h / 2 - screw.y;
-        const samplePoints = [
-            { x: 0, y: 0 },
-            { x: 0, y: -8 },
-            { x: 8, y: 0 },
-            { x: 0, y: 8 },
-            { x: -8, y: 0 },
-            { x: 6, y: -6 },
-            { x: 6, y: 6 },
-            { x: -6, y: 6 },
-            { x: -6, y: -6 }
-        ];
+        const screwLocalX = screw.x - plate.w / 2;
+        const screwLocalY = plate.h / 2 - screw.y;
+        const screwWorld = this.plateLocalToWorld(plate, screwLocalX, screwLocalY);
+
+        const screwRadius = 15;
+        const sampleStep = 5;
+        const samplePoints: { x: number; y: number }[] = [];
+
+        for (let sx = -screwRadius; sx <= screwRadius; sx += sampleStep) {
+            for (let sy = -screwRadius; sy <= screwRadius; sy += sampleStep) {
+                if (sx * sx + sy * sy <= screwRadius * screwRadius) {
+                    samplePoints.push({ x: screwWorld.x + sx, y: screwWorld.y + sy });
+                }
+            }
+        }
+
+        const totalSamples = samplePoints.length;
 
         for (const other of this.plates) {
-            if (other.id === plate.id || other.removed || other.layer <= plate.layer) continue;
-            let insideCount = 0;
-            samplePoints.forEach((point) => {
-                if (this.isPointInsidePlate(other, screwAbsX + point.x, screwAbsY + point.y)) {
-                    insideCount++;
+            if (other.id === plate.id || other.removed || other.state === 'falling' || other.layer <= plate.layer) continue;
+
+            let coveredCount = 0;
+            for (const point of samplePoints) {
+                if (this.isPointInsidePlate(other, point.x, point.y)) {
+                    coveredCount++;
                 }
-            });
-            if (insideCount >= 7) {
+            }
+
+            if (coveredCount / totalSamples >= this.SCREW_BLOCK_COVERAGE) {
                 return true;
             }
         }
+
         return false;
     }
 
     private isPointInsidePlate(plate: PlateData, x: number, y: number) {
-        const rotation = plate.rotation || 0;
-        let localX = x;
-        let localY = y;
+        const local = this.worldToPlateLocal(plate, x, y);
+        if (plate.type === 'circle') {
+            const radius = Math.min(plate.w, plate.h) / 2;
+            return local.x * local.x + local.y * local.y <= radius * radius + 1;
+        }
+        return local.x >= -plate.w / 2 && local.x <= plate.w / 2
+            && local.y >= -plate.h / 2 && local.y <= plate.h / 2;
+    }
 
-        if (rotation !== 0) {
-            const originX = plate.x - plate.w / 2 + (plate.gravityOrigin?.x ?? plate.w / 2);
-            const originY = plate.y + plate.h / 2 - (plate.gravityOrigin?.y ?? plate.h / 2);
-            const rad = -rotation * Math.PI / 180;
-            const dx = x - originX;
-            const dy = y - originY;
-            localX = originX + dx * Math.cos(rad) - dy * Math.sin(rad);
-            localY = originY + dx * Math.sin(rad) + dy * Math.cos(rad);
+    private hasRemainingScrews(plate: PlateData) {
+        return plate.screws.some((screw) => !screw.removed);
+    }
+
+    private getPlatePivotOffset(plate: PlateData) {
+        return {
+            x: (plate.gravityOrigin?.x ?? plate.w / 2) - plate.w / 2,
+            y: plate.h / 2 - (plate.gravityOrigin?.y ?? plate.h / 2)
+        };
+    }
+
+    private getPlateNodePosition(plate: PlateData, centerY: number = plate.y) {
+        const offset = this.getPlatePivotOffset(plate);
+        return new Vec3(plate.x + offset.x, centerY + offset.y, 0);
+    }
+
+    private plateLocalToWorld(plate: PlateData, localX: number, localY: number) {
+        const offset = this.getPlatePivotOffset(plate);
+        const pivotX = plate.x + offset.x;
+        const pivotY = plate.y + offset.y;
+        const rad = (plate.rotation || 0) * Math.PI / 180;
+        const dx = localX - offset.x;
+        const dy = localY - offset.y;
+        return {
+            x: pivotX + dx * Math.cos(rad) - dy * Math.sin(rad),
+            y: pivotY + dx * Math.sin(rad) + dy * Math.cos(rad)
+        };
+    }
+
+    private worldToPlateLocal(plate: PlateData, x: number, y: number) {
+        const offset = this.getPlatePivotOffset(plate);
+        const pivotX = plate.x + offset.x;
+        const pivotY = plate.y + offset.y;
+        const rad = -(plate.rotation || 0) * Math.PI / 180;
+        const dx = x - pivotX;
+        const dy = y - pivotY;
+        return {
+            x: offset.x + dx * Math.cos(rad) - dy * Math.sin(rad),
+            y: offset.y + dx * Math.sin(rad) + dy * Math.cos(rad)
+        };
+    }
+
+    private getPlateWorldBounds(plate: PlateData) {
+        if (plate.type === 'circle') {
+            const center = this.plateLocalToWorld(plate, 0, 0);
+            const radius = Math.min(plate.w, plate.h) / 2;
+            return {
+                minX: center.x - radius,
+                maxX: center.x + radius,
+                minY: center.y - radius,
+                maxY: center.y + radius
+            };
         }
 
-        const left = plate.x - plate.w / 2;
-        const right = plate.x + plate.w / 2;
-        const bottom = plate.y - plate.h / 2;
-        const top = plate.y + plate.h / 2;
-        return localX >= left && localX <= right && localY >= bottom && localY <= top;
+        const corners = [
+            this.plateLocalToWorld(plate, -plate.w / 2, -plate.h / 2),
+            this.plateLocalToWorld(plate, plate.w / 2, -plate.h / 2),
+            this.plateLocalToWorld(plate, plate.w / 2, plate.h / 2),
+            this.plateLocalToWorld(plate, -plate.w / 2, plate.h / 2)
+        ];
+
+        return {
+            minX: Math.min(...corners.map((point) => point.x)),
+            maxX: Math.max(...corners.map((point) => point.x)),
+            minY: Math.min(...corners.map((point) => point.y)),
+            maxY: Math.max(...corners.map((point) => point.y))
+        };
+    }
+
+    private getPlateTopSurfaceYAtX(plate: PlateData, worldX: number) {
+        const bounds = this.getPlateWorldBounds(plate);
+        if (worldX < bounds.minX - 1 || worldX > bounds.maxX + 1) return null;
+
+        const scanTop = bounds.maxY + SUPPORT_SURFACE_SCAN_STEP;
+        const scanBottom = bounds.minY - SUPPORT_SURFACE_SCAN_STEP;
+        let lastOutsideY = scanTop;
+
+        for (let y = scanTop; y >= scanBottom; y -= SUPPORT_SURFACE_SCAN_STEP) {
+            if (!this.isPointInsidePlate(plate, worldX, y)) {
+                lastOutsideY = y;
+                continue;
+            }
+
+            let insideY = y;
+            let outsideY = lastOutsideY;
+            for (let i = 0; i < SUPPORT_SURFACE_REFINE_ITERATIONS; i++) {
+                const midY = (insideY + outsideY) / 2;
+                if (this.isPointInsidePlate(plate, worldX, midY)) {
+                    insideY = midY;
+                } else {
+                    outsideY = midY;
+                }
+            }
+            return insideY;
+        }
+
+        return null;
+    }
+
+
+
+    private dropPlateOutOfScene(plate: PlateData) {
+        if (plate.removed || plate.state === 'falling' || !this.boardEffectNode) return;
+
+        const fallingNode = this.createPlateNode(this.boardEffectNode, plate, false, plate.rotation || 0);
+        if (!fallingNode) return;
+
+        plate.isFalling = true;
+        plate.state = 'falling';
+        this.destroyPlateNode(plate.id);
+        this.fallingPlateNodes.set(plate.id, fallingNode);
+
+        const dropDistance = Math.max(800, this.boardHeight + this.bottomHeight + 220);
+        tween(fallingNode)
+            .to(1.2, { position: new Vec3(fallingNode.position.x, fallingNode.position.y - dropDistance, 0) }, { easing: 'quadIn' })
+            .call(() => {
+                this.triggerVibration('success');
+                plate.removed = true;
+                plate.isFalling = false;
+                plate.state = 'removed';
+                const activeNode = this.fallingPlateNodes.get(plate.id);
+                if (activeNode && activeNode.isValid) {
+                    activeNode.destroy();
+                }
+                this.fallingPlateNodes.delete(plate.id);
+                this.checkAllBoxesForClear();
+                this.renderTopUI();
+                this.checkWin();
+            })
+            .start();
     }
 
     private createNode(name: string, parent: Node, x: number, y: number, width: number, height: number) {
@@ -1276,7 +1574,34 @@ export class GameManager extends Component {
         this.createScrewVisual(host, 0, 0, diameter, color, false);
     }
 
-    private getBoxSlotPositions() {
+    private getBoxSlotPositions(capacity: number) {
+        if (capacity === 4) {
+            return [
+                { x: -17, y: 14 },
+                { x: 17, y: 14 },
+                { x: -17, y: -11 },
+                { x: 17, y: -11 }
+            ];
+        }
+        if (capacity === 5) {
+            return [
+                { x: -19, y: 15 },
+                { x: 19, y: 15 },
+                { x: -19, y: -12 },
+                { x: 19, y: -12 },
+                { x: 0, y: 2 }
+            ];
+        }
+        if (capacity === 6) {
+            return [
+                { x: -19, y: 15 },
+                { x: 0, y: 15 },
+                { x: 19, y: 15 },
+                { x: -19, y: -12 },
+                { x: 0, y: -12 },
+                { x: 19, y: -12 }
+            ];
+        }
         return [
             { x: -16, y: 13 },
             { x: 16, y: 13 },
@@ -1291,7 +1616,8 @@ export class GameManager extends Component {
         const boxHeight = 92;
         const gap = (this.screenWidth - 40 - boxWidth * 4) / 3;
         const startX = -((boxWidth * 4 + gap * 3) / 2) + boxWidth / 2;
-        const slotPositions = this.getBoxSlotPositions();
+        const maxSlots = 6;
+        const allSlotPositions = this.getBoxSlotPositions(maxSlots);
 
         while (this.boxViews.length < this.boxes.length) {
             const index = this.boxViews.length;
@@ -1310,12 +1636,13 @@ export class GameManager extends Component {
             const lockLabel = this.createLabel(boxNode, '解锁\n盒子', 0, 0, 15, new Color(255, 255, 255, 255), true, 19);
             lockLabel.node.active = false;
 
-            const slots: BoxSlotView[] = slotPositions.map((pos, slotIndex) => {
-                const slotNode = this.createNode(`SlotWrap_${slotIndex}`, boxNode, pos.x, pos.y, 24, 24);
-                const holeNode = this.createGraphicsNode(`Slot_${slotIndex}`, slotNode, 24, 24, 0, 0);
+            const slots: BoxSlotView[] = allSlotPositions.map((pos, slotIndex) => {
+                const slotSize = 24;
+                const slotNode = this.createNode(`SlotWrap_${slotIndex}`, boxNode, pos.x, pos.y, slotSize, slotSize);
+                const holeNode = this.createGraphicsNode(`Slot_${slotIndex}`, slotNode, slotSize, slotSize, 0, 0);
                 const hole = holeNode.getComponent(Graphics)!;
                 this.drawCircle(hole, 12, new Color(0, 0, 0, 35), 0);
-                const screwHost = this.createNode(`ScrewHost_${slotIndex}`, slotNode, 0, 0, 24, 24);
+                const screwHost = this.createNode(`ScrewHost_${slotIndex}`, slotNode, 0, 0, slotSize, slotSize);
                 return { node: slotNode, hole, screwHost };
             });
 
